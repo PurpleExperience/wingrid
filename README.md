@@ -33,7 +33,7 @@ Windows 7/10/11
 
 ```bash
 Использование:
-  WinGrid CLI.exe [-h] [--config ПУТЬ] [--list-monitors]
+  WinGridCLI.exe [-h] [--config ПУТЬ] [--list-monitors]
 
 Параметры:
   -h, --help        показать эту справку и выйти
@@ -41,11 +41,11 @@ Windows 7/10/11
   --list-monitors   вывести список обнаруженных мониторов и выйти — окно не открывается
 
 Примеры:
-  WinGrid CLI.exe
+  WinGridCLI.exe
       Показать эту справку (для запуска нужен хотя бы один аргумент).
 
-  WinGrid CLI.exe --config "C:\configs\work.ini"
+  WinGridCLI.exe --config "C:\configs\work.ini"
       Использовать конкретный конфиг вместо последнего использованного.
 
-  WinGrid CLI.exe --list-monitors
+  WinGridCLI.exe --list-monitors
       Вывести список мониторов (разрешение, позиция, масштаб DPI) и выйти.
