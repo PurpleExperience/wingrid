@@ -21,9 +21,9 @@ DEFAULT_MIN_SIZE = (650, 380)
 DEFAULT_SPACING_PX = 8
 TIGHT_OVERLAP_BASE_PX = 15
 TIGHT_SPACING_Y = -8
-AUTO_APPLY_DELAY_MS = 1000
+AUTO_APPLY_DELAY_MS = 10
 AUTO_CLOSE_TOAST_MS = 3000
-ARRANGE_REAPPLY_DELAY_MS = 100
+ARRANGE_REAPPLY_DELAY_MS = 10
 SCROLLABLE_FRAME_WIDTH = 660
 CONFIG_FILE_NAME = "settings.ini"
 ABOUT_CONTACT_HANDLE = "t.me/alex_dev404"
@@ -703,7 +703,7 @@ class WindowManager:
         # arrange_windows() re-applies once more after
         # ARRANGE_REAPPLY_DELAY_MS; wait past that before exiting so both
         # passes actually complete.
-        self.root.after(ARRANGE_REAPPLY_DELAY_MS + 300, self._headless_quit)
+        #self.root.after(ARRANGE_REAPPLY_DELAY_MS + 100, self._headless_quit)
 
     def _headless_quit(self):
         self.root.destroy()
@@ -1776,7 +1776,7 @@ class WindowManager:
         # Windows sometimes ignores the first SetWindowPos right after a
         # SW_RESTORE; re-applying shortly after makes layout reliable.
         # report=False: don't log/toast the same "not found" list twice.
-        self.root.after(ARRANGE_REAPPLY_DELAY_MS, lambda: self._arrange_windows_impl(report=False))
+        #self.root.after(ARRANGE_REAPPLY_DELAY_MS, lambda: self._arrange_windows_impl(report=False))
 
     def _find_window_by_title(self, title, exclude=frozenset()):
         """
