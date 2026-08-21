@@ -323,7 +323,26 @@ class MonitorLayoutPreview(tk.Canvas):
         self.colors = colors
         self.translations = translations  # {'primary': ..., 'windows_label': ...}
         self.get_window_counts = get_window_counts or (lambda: [0] * len(monitors))
-        self.bind("<Configure>", lambda e: self._redraw())
+        # Debounced: <Configure> fires on every single pixel while the
+        # user drags-resizes the main window, and a full redraw (delete
+        # all canvas items + recreate rectangles/text for every monitor)
+        # on each one of those events was visibly janky during live
+        # resize. Coalesce rapid-fire resize events into one redraw
+        # shortly after they stop.
+        self._redraw_after_id = None
+        self.bind("<Configure>", self._schedule_redraw)
+        self._redraw()
+
+    def _schedule_redraw(self, _event=None):
+        if self._redraw_after_id is not None:
+            try:
+                self.after_cancel(self._redraw_after_id)
+            except (ValueError, tk.TclError):
+                pass
+        self._redraw_after_id = self.after(30, self._debounced_redraw)
+
+    def _debounced_redraw(self):
+        self._redraw_after_id = None
         self._redraw()
 
     def refresh(self):
@@ -479,6 +498,8 @@ class WindowManager:
         self.current_language = 'ru'
         self.window_inputs = []
         self.monitor_frames = []
+        self._validity_after_id = None
+        self._resize_repaint_after_id = None
 
         if getattr(sys, 'frozen', False):
             application_path = os.path.dirname(sys.executable)
@@ -751,6 +772,35 @@ class WindowManager:
         """
         if event.widget is self.root:
             self._close_title_picker_popup()
+            self._schedule_resize_repaint()
+
+    def _schedule_resize_repaint(self):
+        """
+        A Canvas with embedded native child widgets (create_window — used
+        for the scrollable window-title list) can fail to repaint some of
+        those children during a live drag-resize on Windows, leaving
+        stale blank strips where a row's monitor label/dropdown used to
+        be until something forces a fresh paint pass. Once resizing has
+        been quiet for a moment, force one so nothing is left stuck.
+        """
+        if self._resize_repaint_after_id is not None:
+            try:
+                self.root.after_cancel(self._resize_repaint_after_id)
+            except (ValueError, tk.TclError):
+                pass
+        self._resize_repaint_after_id = self.root.after(80, self._force_resize_repaint)
+
+    def _force_resize_repaint(self):
+        self._resize_repaint_after_id = None
+        try:
+            # update_idletasks alone doesn't always fix this on Windows —
+            # it only flushes pending geometry/idle work. A full update()
+            # additionally processes pending Expose/paint events, which is
+            # what actually clears the stale strips.
+            self.root.update_idletasks()
+            self.root.update()
+        except tk.TclError:
+            pass
 
     def on_closing(self):
         # No auto-save on close: persisting is now explicit (the "Save
@@ -992,10 +1042,16 @@ class WindowManager:
         # Code/GUI improvement #11: keep inner frame width in sync with the
         # canvas so the window-list area actually uses extra horizontal
         # space if the window is ever made wider (was previously fixed).
-        self.canvas.bind(
-            "<Configure>",
-            lambda e: self.canvas.itemconfig(self._canvas_window, width=e.width)
-        )
+        #
+        # Debounced: dragging the main window's edge fires <Configure> on
+        # every single pixel. Each itemconfig(width=...) here forces Tk to
+        # re-run pack layout for every row inside scrollable_frame (label +
+        # combobox + entry + 3 buttons per window title row), which gets
+        # visibly janky once there are more than a handful of rows.
+        # Coalescing into one reflow shortly after resizing stops keeps the
+        # window responsive while still ending up at the right width.
+        self._width_sync_after_id = None
+        self.canvas.bind("<Configure>", self._schedule_canvas_width_sync)
 
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -1005,6 +1061,23 @@ class WindowManager:
         # scrolling everywhere in the app, including comboboxes.
         self.canvas.bind('<Enter>', lambda e: self.canvas.bind_all("<MouseWheel>", self._on_mousewheel))
         self.canvas.bind('<Leave>', lambda e: self.canvas.unbind_all("<MouseWheel>"))
+
+    def _schedule_canvas_width_sync(self, event):
+        pending_width = event.width
+        if self._width_sync_after_id is not None:
+            try:
+                self.canvas.after_cancel(self._width_sync_after_id)
+            except (ValueError, tk.TclError):
+                pass
+        self._width_sync_after_id = self.canvas.after(
+            30, lambda: self._apply_canvas_width_sync(pending_width))
+
+    def _apply_canvas_width_sync(self, width):
+        self._width_sync_after_id = None
+        try:
+            self.canvas.itemconfig(self._canvas_window, width=width)
+        except tk.TclError:
+            pass
 
     def _on_mousewheel(self, event):
         self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
@@ -1436,24 +1509,46 @@ class WindowManager:
             self.layout_preview.refresh()
 
     def _on_entry_changed(self, entry):
+        """
+        Debounced: this fires on every <KeyRelease>, and validity refresh
+        does a full EnumWindows-based scan. Without debouncing, typing a
+        single window title fired one full scan per keystroke. Collapse
+        rapid-fire calls into a single scan ~250ms after the user stops
+        typing.
+        """
         self.mark_dirty()
-        self._refresh_window_titles_validity()
+        if self._validity_after_id is not None:
+            try:
+                self.root.after_cancel(self._validity_after_id)
+            except (ValueError, tk.TclError):
+                pass
+        self._validity_after_id = self.root.after(250, self._refresh_window_titles_validity)
 
-    def _count_matching_windows(self, title):
-        """How many currently open windows' text contains `title` as a substring."""
+    def _count_matching_windows(self, title, snapshot=None):
+        """
+        How many currently open windows' text contains `title` as a
+        substring. Accepts an optional pre-collected snapshot (see
+        _snapshot_visible_windows) to avoid a fresh EnumWindows pass per
+        call when checking many titles in one go.
+        """
+        title_lower = title.lower()
+
+        if snapshot is not None:
+            return sum(1 for _h, text in snapshot if title_lower in text.lower())
+
         count = 0
 
         def enum_cb(h, _):
             nonlocal count
             if win32gui.IsWindowVisible(h):
                 text = win32gui.GetWindowText(h)
-                if text and title.lower() in text.lower():
+                if text and title_lower in text.lower():
                     count += 1
 
         win32gui.EnumWindows(enum_cb, None)
         return count
 
-    def _refresh_window_titles_validity(self):
+    def _refresh_window_titles_validity(self, snapshot=None):
         """
         Colors every window-title entry green or red. This has to look at
         ALL entries together, not one at a time: if five rows share the
@@ -1463,7 +1558,17 @@ class WindowManager:
         itself is "valid" and exists elsewhere in the list. This mirrors
         exactly how _arrange_windows_impl claims windows one-by-one per
         duplicate title, so the color always matches what Apply will do.
+
+        Performance: takes a single EnumWindows snapshot up front (unless
+        one is already supplied by the caller, e.g. _arrange_windows_impl
+        reusing the snapshot it already took) instead of re-enumerating
+        all windows once per distinct title.
         """
+        self._validity_after_id = None
+
+        if snapshot is None:
+            snapshot = self._snapshot_visible_windows()
+
         seen_so_far = {}    # title (lowercased) -> how many rows with it we've passed
         available_cache = {}  # title (lowercased) -> how many real windows match it
 
@@ -1477,7 +1582,7 @@ class WindowManager:
             seen_so_far[key] = rank
 
             if key not in available_cache:
-                available_cache[key] = self._count_matching_windows(title)
+                available_cache[key] = self._count_matching_windows(title, snapshot=snapshot)
             available = available_cache[key]
 
             will_be_found = rank <= available
@@ -1778,7 +1883,30 @@ class WindowManager:
         # report=False: don't log/toast the same "not found" list twice.
         #self.root.after(ARRANGE_REAPPLY_DELAY_MS, lambda: self._arrange_windows_impl(report=False))
 
-    def _find_window_by_title(self, title, exclude=frozenset()):
+    def _snapshot_visible_windows(self):
+        """
+        One single EnumWindows pass over all top-level visible windows,
+        collecting (hwnd, title) pairs. This used to be re-done from
+        scratch — via a fresh EnumWindows + GetWindowText per call — for
+        every single row in _find_window_by_title, and again for every
+        distinct title in _count_matching_windows. With N configured
+        windows and M open windows that was O(N*M) GetWindowText calls
+        (each a cross-process SendMessage, the most expensive part of
+        this). Taking one snapshot per arrange/validity pass and matching
+        against it in memory makes it O(N+M) instead.
+        """
+        windows = []
+
+        def enum_cb(h, _):
+            if win32gui.IsWindowVisible(h):
+                text = win32gui.GetWindowText(h)
+                if text:
+                    windows.append((h, text))
+
+        win32gui.EnumWindows(enum_cb, None)
+        return windows
+
+    def _find_window_by_title(self, title, exclude=frozenset(), snapshot=None):
         """
         Bug fix #3: exact FindWindow match breaks the moment a title changes
         slightly (e.g. Notepad adding '*' for unsaved changes). Fall back to
@@ -1789,47 +1917,54 @@ class WindowManager:
         window instead of every row grabbing the same one — see
         _arrange_windows_impl, which tracks handles already claimed in the
         current pass and excludes them here.
+
+        `snapshot` is an optional pre-collected list of (hwnd, title) pairs
+        from _snapshot_visible_windows(). When the caller is doing this for
+        many rows in one pass (arranging, or refreshing validity), it
+        should take one snapshot up front and pass it in here every time,
+        instead of letting this method re-enumerate all windows on every
+        call.
         """
         hwnd = win32gui.FindWindow(None, title)
         if hwnd and hwnd not in exclude:
             return hwnd
 
+        title_lower = title.lower()
+
+        if snapshot is not None:
+            for h, text in snapshot:
+                if h not in exclude and title_lower in text.lower():
+                    return h
+            return None
+
+        # No snapshot supplied (e.g. a one-off lookup like the "⚙" custom
+        # geometry dialog) — fall back to a fresh enumeration.
         matches = []
 
         def enum_cb(h, _):
             if win32gui.IsWindowVisible(h) and h not in exclude:
                 text = win32gui.GetWindowText(h)
-                if text and title.lower() in text.lower():
+                if text and title_lower in text.lower():
                     matches.append(h)
 
         win32gui.EnumWindows(enum_cb, None)
         return matches[0] if matches else None
 
     def _position_window(self, hwnd, x, y, width, height, window_title):
-        """Restores/positions/raises one window — shared by both the
-        automatic grid layout and custom per-window overrides."""
+        """
+        Restores/positions/raises one window — shared by both the
+        automatic grid layout and custom per-window overrides. A single
+        SetWindowPos(HWND_TOP, ...) call per window; no topmost/notopmost
+        toggle and no SetForegroundWindow — both were extra Win32 round
+        trips that aren't needed just to lay windows out.
+        """
         if win32gui.IsIconic(hwnd):
             win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
 
         try:
-            # Bug fix: HWND_TOP alone only raises the window above its
-            # immediate siblings — it doesn't reliably beat unrelated
-            # windows from other apps that happen to already be on top.
-            # Briefly forcing it topmost, then immediately releasing that
-            # flag, is the standard trick to push a window above
-            # everything else without leaving it stuck "always on top".
-            win32gui.SetWindowPos(hwnd, win32con.HWND_TOPMOST, x, y,
-                                   width, height, win32con.SWP_SHOWWINDOW)
-            win32gui.SetWindowPos(hwnd, win32con.HWND_NOTOPMOST, x, y,
+            win32gui.SetWindowPos(hwnd, win32con.HWND_TOP, x, y,
                                    width, height, win32con.SWP_SHOWWINDOW)
             win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
-            try:
-                win32gui.SetForegroundWindow(hwnd)
-            except Exception:
-                # Windows can refuse foreground-focus requests from
-                # background processes — the window is still correctly
-                # positioned and on top either way.
-                pass
         except Exception as e:
             self.logger.error(f"Failed to position window '{window_title}': {e}")
 
@@ -1857,6 +1992,12 @@ class WindowManager:
         # titles (e.g. two windows both "Untitled - Notepad") each get a
         # different physical window instead of all rows grabbing the same one.
         claimed_handles = set()
+
+        # Performance: take ONE EnumWindows snapshot for the whole arrange
+        # pass instead of letting _find_window_by_title re-enumerate every
+        # visible window on every single lookup. This is the single
+        # biggest win for large window lists / busy desktops.
+        snapshot = self._snapshot_visible_windows()
 
         for monitor_index, monitor_windows in windows_by_monitor.items():
             if monitor_index >= len(self.monitor_frames):
@@ -1916,7 +2057,7 @@ class WindowManager:
 
                 for i, entry in enumerate(auto_windows):
                     window_title = entry.get()
-                    hwnd = self._find_window_by_title(window_title, exclude=claimed_handles)
+                    hwnd = self._find_window_by_title(window_title, exclude=claimed_handles, snapshot=snapshot)
 
                     if hwnd:
                         claimed_handles.add(hwnd)
@@ -1930,7 +2071,7 @@ class WindowManager:
 
             for entry in custom_windows:
                 window_title = entry.get()
-                hwnd = self._find_window_by_title(window_title, exclude=claimed_handles)
+                hwnd = self._find_window_by_title(window_title, exclude=claimed_handles, snapshot=snapshot)
 
                 if hwnd:
                     claimed_handles.add(hwnd)
@@ -1942,7 +2083,7 @@ class WindowManager:
                 else:
                     window_not_found.append(window_title)
 
-        self._refresh_window_titles_validity()
+        self._refresh_window_titles_validity(snapshot=snapshot)
 
         if report and window_not_found:
             if self.headless:
